@@ -1,0 +1,121 @@
+name: Accessibility Scan
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  accessibility-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install axe-core CLI and http-server
+        run: npm install -g @axe-core/cli http-server
+
+      - name: Start HTTP server
+        run: http-server . -p 8080 &
+        shell: bash
+
+      - name: Wait for server to be ready
+        run: |
+          TIMEOUT=30
+          ELAPSED=0
+          until curl -s http://localhost:8080 > /dev/null; do
+            sleep 1
+            ELAPSED=$((ELAPSED + 1))
+            if [ "${ELAPSED}" -ge "${TIMEOUT}" ]; then
+              echo "Timed out waiting for http-server to start"
+              exit 1
+            fi
+          done
+          echo "Server is ready after ${ELAPSED}s"
+
+      - name: Scan all HTML files for accessibility issues
+        id: axe_scan
+        continue-on-error: true
+        run: |
+          HTML_FILES=$(find . -name "*.html" -not -path '*/node_modules/*' -not -path '*/.git/*' | sed 's|^\./||')
+          TOTAL_FILES=0
+          TOTAL_ISSUES=0
+          REPORT=""
+
+          SCAN_TIME=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+
+          REPORT+="## Accessibility Scan Report\n\n"
+          REPORT+="**Scan date/time:** ${SCAN_TIME}\n\n"
+
+          for FILE in $HTML_FILES; do
+            TOTAL_FILES=$((TOTAL_FILES + 1))
+            URL="http://localhost:8080/${FILE}"
+
+            echo "::group::Scanning ${FILE}"
+            echo "Running axe on: ${URL}"
+
+            AXE_OUTPUT=$(axe "${URL}" --exit 2>&1 || true)
+            echo "${AXE_OUTPUT}"
+            echo "::endgroup::"
+
+            # Count violations from output
+            ISSUE_COUNT=0
+            if echo "${AXE_OUTPUT}" | grep -q "Found [0-9]* accessibility violations"; then
+              ISSUE_COUNT=$(echo "${AXE_OUTPUT}" | grep -oP 'Found \K[0-9]+(?= accessibility violations?)')
+              if [ -z "${ISSUE_COUNT}" ]; then
+                ISSUE_COUNT=0
+              fi
+            fi
+            TOTAL_ISSUES=$((TOTAL_ISSUES + ISSUE_COUNT))
+
+            REPORT+="### File: \`${FILE}\`\n\n"
+            REPORT+="**URL scanned:** \`${URL}\`\n\n"
+            REPORT+="\`\`\`\n${AXE_OUTPUT}\n\`\`\`\n\n"
+            if [ "${ISSUE_COUNT}" -gt 0 ]; then
+              REPORT+="⚠️ **${ISSUE_COUNT} accessibility violation(s) found**\n\n"
+            else
+              REPORT+="✅ **No accessibility violations found**\n\n"
+            fi
+            REPORT+="---\n\n"
+          done
+
+          REPORT+="## Summary\n\n"
+          REPORT+="- **Total HTML files scanned:** ${TOTAL_FILES}\n"
+          REPORT+="- **Total accessibility issues found:** ${TOTAL_ISSUES}\n\n"
+
+          if [ "${TOTAL_ISSUES}" -gt 0 ]; then
+            REPORT+="> ⚠️ Accessibility issues were detected. Please review the violations above and fix them to improve accessibility.\n"
+          else
+            REPORT+="> ✅ No accessibility issues detected across all scanned files.\n"
+          fi
+
+          printf '%s' "${REPORT}" >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "total_files=${TOTAL_FILES}" >> "${GITHUB_OUTPUT}"
+          echo "total_issues=${TOTAL_ISSUES}" >> "${GITHUB_OUTPUT}"
+
+      - name: Print scan summary
+        run: |
+          echo "========================================"
+          echo "  Accessibility Scan Complete"
+          echo "========================================"
+          echo "  Total files scanned : ${{ steps.axe_scan.outputs.total_files }}"
+          echo "  Total issues found  : ${{ steps.axe_scan.outputs.total_issues }}"
+          echo "========================================"
+
+      - name: Stop HTTP server
+        if: always()
+        run: |
+          pkill -f "http-server" || true
